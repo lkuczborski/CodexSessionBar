@@ -28,7 +28,7 @@ struct TrackerWindowView: View {
                                 .lineLimit(1)
 
                             HStack(spacing: 8) {
-                                sessionTag(title: session.activityLabel, color: session.isLoaded ? .green.opacity(0.2) : .gray.opacity(0.14))
+                                sessionTag(title: session.activityLabel, color: session.isLive ? .green.opacity(0.2) : .gray.opacity(0.14))
                                 sessionTag(title: session.sourceLabel)
 
                                 if !session.modelProvider.isEmpty {

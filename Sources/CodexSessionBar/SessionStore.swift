@@ -14,9 +14,9 @@ final class SessionStore: ObservableObject {
             return "Codex"
         }
 
-        let loadedCount = sessions.filter(\.isLoaded).count
-        if loadedCount > 0 {
-            return "Codex \(loadedCount)"
+        let liveCount = sessions.filter(\.isLive).count
+        if liveCount > 0 {
+            return "Codex \(liveCount)"
         }
 
         return "Codex \(sessions.count)"
@@ -28,6 +28,8 @@ final class SessionStore: ObservableObject {
 
     private let client = CodexAppServerClient()
     private var pollingTask: Task<Void, Never>?
+    private var eventObservationTask: Task<Void, Never>?
+    private var scheduledRefreshTask: Task<Void, Never>?
     private var didStart = false
 
     init() {
@@ -40,6 +42,14 @@ final class SessionStore: ObservableObject {
         }
 
         didStart = true
+
+        eventObservationTask = Task {
+            let eventStream = await client.eventStream()
+            for await _ in eventStream {
+                scheduleRefreshSoon()
+            }
+        }
+
         pollingTask = Task {
             await refreshNow()
             while !Task.isCancelled {
@@ -63,19 +73,31 @@ final class SessionStore: ObservableObject {
             self.lastRefresh = Date()
             self.lastError = nil
 
-            let loadedCount = sessions.filter(\.isLoaded).count
+            let liveCount = sessions.filter(\.isLive).count
             if sessions.isEmpty {
                 statusText = "No tracked sessions"
-            } else if loadedCount == 0 {
+            } else if liveCount == 0 {
                 statusText = "\(sessions.count) recent sessions"
-            } else if loadedCount == 1 {
-                statusText = "1 loaded, \(sessions.count) tracked"
+            } else if liveCount == 1 {
+                statusText = "1 live, \(sessions.count) tracked"
             } else {
-                statusText = "\(loadedCount) loaded, \(sessions.count) tracked"
+                statusText = "\(liveCount) live, \(sessions.count) tracked"
             }
         } catch {
             lastError = error.localizedDescription
             statusText = "Unable to load sessions"
+        }
+    }
+
+    private func scheduleRefreshSoon() {
+        scheduledRefreshTask?.cancel()
+        scheduledRefreshTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled else {
+                return
+            }
+
+            await self?.refreshNow()
         }
     }
 
@@ -104,5 +126,7 @@ final class SessionStore: ObservableObject {
 
     deinit {
         pollingTask?.cancel()
+        eventObservationTask?.cancel()
+        scheduledRefreshTask?.cancel()
     }
 }

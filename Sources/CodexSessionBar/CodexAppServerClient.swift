@@ -2,86 +2,68 @@ import Darwin
 import Foundation
 
 actor CodexAppServerClient {
-    private let jsonDecoder = JSONDecoder()
     private let requestTimeout: TimeInterval = 8
+    private var connection: AppServerConnection?
+    private var eventContinuations: [UUID: AsyncStream<AppServerEvent>.Continuation] = [:]
 
-    func fetchActiveSessions() throws -> [ActiveSession] {
-        guard let codexExecutable = resolveCodexExecutable() else {
-            throw ClientError.codexNotFound
-        }
-
-        let session = try AppServerSession(codexExecutable: codexExecutable)
-        defer { session.close() }
-
-        var requestID = 1
-        func nextRequestID() -> Int {
-            defer { requestID += 1 }
-            return requestID
-        }
-
-        let initializeResponse = try session.sendRequest(
-            id: nextRequestID(),
-            method: "initialize",
-            params: InitializeParams(
-                clientInfo: InitializeClientInfo(name: "codex-session-bar", title: "Codex Session Bar", version: "0.3.0"),
-                capabilities: InitializeCapabilities(experimentalApi: true)
-            ),
-            timeout: requestTimeout
-        )
-        let _: InitializeResponse = try decodeResult(from: initializeResponse)
-
-        var loadedIDs = Set<String>()
-        var loadedCursor: String?
-        while true {
-            let response = try session.sendRequest(
-                id: nextRequestID(),
-                method: "thread/loaded/list",
-                params: ThreadLoadedListParams(cursor: loadedCursor, limit: 250),
-                timeout: requestTimeout
-            )
-            let page: ThreadLoadedListResponse = try decodeResult(from: response)
-            loadedIDs.formUnion(page.data)
-
-            guard let nextCursor = page.nextCursor, !nextCursor.isEmpty else {
-                break
-            }
-            loadedCursor = nextCursor
-        }
-
-        var threads: [CodexThread] = []
-        var threadCursor: String?
-        while true {
-            let response = try session.sendRequest(
-                id: nextRequestID(),
-                method: "thread/list",
-                params: ThreadListParams(cursor: threadCursor, limit: 250, sortKey: "updated_at", archived: false),
-                timeout: requestTimeout
-            )
-            let page: ThreadListResponse = try decodeResult(from: response)
-            threads.append(contentsOf: page.data)
-
-            guard let nextCursor = page.nextCursor, !nextCursor.isEmpty else {
-                break
-            }
-            threadCursor = nextCursor
+    func fetchActiveSessions() async throws -> [ActiveSession] {
+        let connection = try await sharedConnection()
+        let threads = try await Self.collectAllPages { cursor in
+            try await connection.listThreads(cursor: cursor)
         }
 
         return Self.selectTrackedSessions(
             threads: threads,
-            loadedIDs: loadedIDs,
             now: Date(),
             recentWindow: 24 * 60 * 60
         )
     }
 
+    private func sharedConnection() async throws -> AppServerConnection {
+        if let connection {
+            return connection
+        }
+
+        guard let codexExecutable = resolveCodexExecutable() else {
+            throw ClientError.codexNotFound
+        }
+
+        let connection = AppServerConnection(
+            codexExecutable: codexExecutable,
+            requestTimeout: requestTimeout,
+            eventSink: { [weak self] event in
+                Task {
+                    await self?.broadcast(event)
+                }
+            }
+        )
+        self.connection = connection
+        return connection
+    }
+
+    func eventStream() -> AsyncStream<AppServerEvent> {
+        AsyncStream { continuation in
+            let id = UUID()
+            Task {
+                self.addEventContinuation(continuation, id: id)
+            }
+
+            continuation.onTermination = { [weak self] _ in
+                Task {
+                    await self?.removeEventContinuation(id: id)
+                }
+            }
+        }
+    }
+
     static func collectAllPages<T>(
-        fetchPage: (String?) throws -> (data: [T], nextCursor: String?)
-    ) rethrows -> [T] {
+        fetchPage: (String?) async throws -> (data: [T], nextCursor: String?)
+    ) async rethrows -> [T] {
         var allItems: [T] = []
-        var cursor: String? = nil
+        var cursor: String?
 
         while true {
-            let page = try fetchPage(cursor)
+            let page = try await fetchPage(cursor)
             allItems.append(contentsOf: page.data)
 
             guard let nextCursor = page.nextCursor, !nextCursor.isEmpty else {
@@ -96,16 +78,14 @@ actor CodexAppServerClient {
 
     static func selectTrackedSessions(
         threads: [CodexThread],
-        loadedIDs: Set<String>,
         now: Date,
         recentWindow: TimeInterval
     ) -> [ActiveSession] {
         let recentCutoff = now.addingTimeInterval(-recentWindow)
 
         let trackedThreads = threads.filter { thread in
-            let isLoaded = loadedIDs.contains(thread.id)
             let updatedDate = Date(timeIntervalSince1970: thread.updatedAt)
-            return isLoaded || updatedDate >= recentCutoff
+            return thread.runtimeStatus.isLoaded || updatedDate >= recentCutoff
         }
 
         let sessions = trackedThreads.map { thread in
@@ -118,25 +98,11 @@ actor CodexAppServerClient {
                 source: thread.source,
                 createdAt: Date(timeIntervalSince1970: thread.createdAt),
                 updatedAt: Date(timeIntervalSince1970: thread.updatedAt),
-                isLoaded: loadedIDs.contains(thread.id)
+                runtimeStatus: thread.runtimeStatus
             )
         }
 
         return sessions.sorted { $0.updatedAt > $1.updatedAt }
-    }
-
-    private func decodeResult<T: Decodable>(from response: [String: Any]) throws -> T {
-        if let error = response["error"] as? [String: Any] {
-            let message = error["message"] as? String ?? "Unknown error"
-            throw ClientError.rpcError(message)
-        }
-
-        guard let resultObject = response["result"] else {
-            throw ClientError.missingResult
-        }
-
-        let resultData = try JSONSerialization.data(withJSONObject: resultObject)
-        return try jsonDecoder.decode(T.self, from: resultData)
     }
 
     private func resolveCodexExecutable() -> String? {
@@ -159,22 +125,127 @@ actor CodexAppServerClient {
 
         return fallbackPaths.first(where: { FileManager.default.isExecutableFile(atPath: $0) })
     }
+
+    private func addEventContinuation(
+        _ continuation: AsyncStream<AppServerEvent>.Continuation,
+        id: UUID
+    ) {
+        eventContinuations[id] = continuation
+    }
+
+    private func removeEventContinuation(id: UUID) {
+        eventContinuations.removeValue(forKey: id)
+    }
+
+    private func broadcast(_ event: AppServerEvent) {
+        for continuation in eventContinuations.values {
+            continuation.yield(event)
+        }
+    }
 }
 
-private final class AppServerSession {
-    private let process: Process
-    private let stdinHandle: FileHandle
-    private let stdoutHandle: FileHandle
-    private let stderrHandle: FileHandle
-    private let stdoutFD: Int32
+private actor AppServerConnection {
+    private let codexExecutable: String
+    private let requestTimeout: TimeInterval
+    private let jsonDecoder = JSONDecoder()
+    private let eventSink: @Sendable (AppServerEvent) -> Void
 
-    private var closed = false
+    private var process: Process?
+    private var stdinHandle: FileHandle?
+    private var stdoutHandle: FileHandle?
+    private var stderrHandle: FileHandle?
+    private var stdoutSource: DispatchSourceRead?
+    private var stderrSource: DispatchSourceRead?
+
     private var stdoutBuffer = Data()
-    private var responseByID: [Int: [String: Any]] = [:]
-    private var stderrCache = Data()
-    private var didReadStderr = false
+    private var stderrBuffer = Data()
+    private var nextRequestID = 1
+    private var pendingResponses: [Int: CheckedContinuation<ResponsePayload, Error>] = [:]
+    private var timeoutTasks: [Int: Task<Void, Never>] = [:]
+    private var didSendInitialized = false
+    private var processTerminationReason: String?
 
-    init(codexExecutable: String) throws {
+    init(
+        codexExecutable: String,
+        requestTimeout: TimeInterval,
+        eventSink: @escaping @Sendable (AppServerEvent) -> Void
+    ) {
+        self.codexExecutable = codexExecutable
+        self.requestTimeout = requestTimeout
+        self.eventSink = eventSink
+    }
+
+    func listThreads(cursor: String?) async throws -> (data: [CodexThread], nextCursor: String?) {
+        let response: ThreadListResponse = try await sendRequest(
+            method: "thread/list",
+            params: ThreadListParams(
+                cursor: cursor,
+                limit: 250,
+                sortKey: "updated_at",
+                archived: false,
+                sourceKinds: SessionSourceKind.threadListFilterValues
+            )
+        )
+        return (response.data, response.nextCursor)
+    }
+
+    private func sendRequest<Params: Encodable, Response: Decodable>(
+        method: String,
+        params: Params
+    ) async throws -> Response {
+        try await ensureConnected()
+
+        let id = nextRequestID
+        nextRequestID += 1
+
+        let payload = try JSONEncoder().encode(AnyEncodable(RequestEnvelope(id: id, method: method, params: params)))
+        let response = try await sendPayload(payload, id: id)
+        return try decodeResult(from: response)
+    }
+
+    private func ensureConnected() async throws {
+        if process != nil, didSendInitialized {
+            return
+        }
+
+        try startProcess()
+
+        do {
+            let initializeResponse = try await sendPayload(
+                JSONEncoder().encode(
+                    AnyEncodable(
+                        RequestEnvelope(
+                            id: nextRequestID,
+                            method: "initialize",
+                            params: InitializeParams(
+                                clientInfo: InitializeClientInfo(
+                                    name: "codex-session-bar",
+                                    title: "Codex Session Bar",
+                                    version: "0.4.0"
+                                ),
+                                capabilities: InitializeCapabilities(experimentalApi: true)
+                            )
+                        )
+                    )
+                ),
+                id: nextRequestID
+            )
+            nextRequestID += 1
+
+            let _: InitializeResponse = try decodeResult(from: initializeResponse)
+            try sendNotification(method: "initialized", params: EmptyParams())
+            didSendInitialized = true
+        } catch {
+            await handleTransportFailure(error)
+            throw error
+        }
+    }
+
+    private func startProcess() throws {
+        guard process == nil else {
+            return
+        }
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: codexExecutable)
         process.arguments = ["app-server", "--listen", "stdio://"]
@@ -186,6 +257,11 @@ private final class AppServerSession {
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
+        process.terminationHandler = { [weak self] process in
+            Task {
+                await self?.handleProcessTermination(status: process.terminationStatus)
+            }
+        }
 
         do {
             try process.run()
@@ -197,110 +273,122 @@ private final class AppServerSession {
         self.stdinHandle = stdinPipe.fileHandleForWriting
         self.stdoutHandle = stdoutPipe.fileHandleForReading
         self.stderrHandle = stderrPipe.fileHandleForReading
-        self.stdoutFD = stdoutHandle.fileDescriptor
+        self.processTerminationReason = nil
+        self.didSendInitialized = false
 
-        let flags = fcntl(stdoutFD, F_GETFL)
-        if flags == -1 || fcntl(stdoutFD, F_SETFL, flags | O_NONBLOCK) == -1 {
+        try configureReadSource(
+            handle: stdoutPipe.fileHandleForReading,
+            existingSource: &stdoutSource,
+            append: { [weak self] data in
+                Task { await self?.consumeStdout(data) }
+            },
+            fail: { [weak self] error in
+                Task { await self?.handleTransportFailure(error) }
+            }
+        )
+
+        try configureReadSource(
+            handle: stderrPipe.fileHandleForReading,
+            existingSource: &stderrSource,
+            append: { [weak self] data in
+                Task { await self?.appendStderr(data) }
+            },
+            fail: { [weak self] error in
+                Task { await self?.handleTransportFailure(error) }
+            }
+        )
+    }
+
+    private func configureReadSource(
+        handle: FileHandle,
+        existingSource: inout DispatchSourceRead?,
+        append: @escaping @Sendable (Data) -> Void,
+        fail: @escaping @Sendable (ClientError) -> Void
+    ) throws {
+        existingSource?.cancel()
+
+        let fileDescriptor = handle.fileDescriptor
+        let flags = fcntl(fileDescriptor, F_GETFL)
+        if flags == -1 || fcntl(fileDescriptor, F_SETFL, flags | O_NONBLOCK) == -1 {
             throw ClientError.stdoutSetupFailed
+        }
+
+        let queue = DispatchQueue(label: "CodexSessionBar.\(fileDescriptor)")
+        let source = DispatchSource.makeReadSource(fileDescriptor: fileDescriptor, queue: queue)
+        source.setEventHandler {
+            var chunk = [UInt8](repeating: 0, count: 4096)
+            var buffered = Data()
+
+            while true {
+                let readCount = Darwin.read(fileDescriptor, &chunk, chunk.count)
+                if readCount > 0 {
+                    buffered.append(contentsOf: chunk.prefix(readCount))
+                    continue
+                }
+
+                if readCount == 0 {
+                    break
+                }
+
+                if errno == EAGAIN || errno == EWOULDBLOCK {
+                    break
+                }
+
+                fail(.stdoutReadFailed(String(cString: strerror(errno))))
+                return
+            }
+
+            if !buffered.isEmpty {
+                append(buffered)
+            }
+        }
+        source.resume()
+        existingSource = source
+    }
+
+    private func sendNotification<Params: Encodable>(
+        method: String,
+        params: Params
+    ) throws {
+        guard let stdinHandle else {
+            throw ClientError.disconnected
+        }
+
+        let payload = try JSONEncoder().encode(AnyEncodable(NotificationEnvelope(method: method, params: params)))
+        stdinHandle.write(payload)
+        stdinHandle.write(Data([0x0A]))
+    }
+
+    private func sendPayload(_ payload: Data, id: Int) async throws -> ResponsePayload {
+        guard let stdinHandle else {
+            throw ClientError.disconnected
+        }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            pendingResponses[id] = continuation
+            timeoutTasks[id] = Task { [requestTimeout] in
+                try? await Task.sleep(for: .seconds(requestTimeout))
+                await self.handleRequestTimeout(id: id, timeout: requestTimeout)
+            }
+
+            stdinHandle.write(payload)
+            stdinHandle.write(Data([0x0A]))
         }
     }
 
-    deinit {
-        close()
-    }
-
-    func close() {
-        guard !closed else {
+    private func handleRequestTimeout(id: Int, timeout: TimeInterval) async {
+        guard let continuation = pendingResponses.removeValue(forKey: id) else {
             return
         }
 
-        closed = true
-
-        if process.isRunning {
-            process.terminate()
-            process.waitUntilExit()
-        }
-
-        cacheStderr()
-
-        try? stdinHandle.close()
-        try? stdoutHandle.close()
-        try? stderrHandle.close()
+        timeoutTasks.removeValue(forKey: id)?.cancel()
+        continuation.resume(throwing: ClientError.requestTimedOut(timeout, cachedStderrText()))
+        await handleTransportFailure(ClientError.requestTimedOut(timeout, cachedStderrText()))
     }
 
-    func sendRequest<Params: Encodable>(
-        id: Int,
-        method: String,
-        params: Params,
-        timeout: TimeInterval
-    ) throws -> [String: Any] {
-        let request = RequestEnvelope(id: id, method: method, params: params)
-        let payload = try JSONEncoder().encode(AnyEncodable(request))
+    private func consumeStdout(_ data: Data) {
+        stdoutBuffer.append(data)
 
-        stdinHandle.write(payload)
-        stdinHandle.write(Data([0x0A]))
-
-        return try waitForResponse(id: id, timeout: timeout)
-    }
-
-    private func waitForResponse(id: Int, timeout: TimeInterval) throws -> [String: Any] {
-        let deadline = Date().addingTimeInterval(timeout)
-
-        while Date() < deadline {
-            if let response = responseByID.removeValue(forKey: id) {
-                return response
-            }
-
-            try pumpStdout()
-
-            if !process.isRunning {
-                try pumpStdout(flushRemainder: true)
-                if let response = responseByID.removeValue(forKey: id) {
-                    return response
-                }
-
-                let stderrText = cachedStderrText()
-                throw ClientError.processFailed(stderrText)
-            }
-
-            Thread.sleep(forTimeInterval: 0.01)
-        }
-
-        process.terminate()
-        process.waitUntilExit()
-        let stderrText = cachedStderrText()
-        throw ClientError.requestTimedOut(timeout, stderrText)
-    }
-
-    private func pumpStdout(flushRemainder: Bool = false) throws {
-        var chunk = [UInt8](repeating: 0, count: 4096)
-
-        while true {
-            let readCount = Darwin.read(stdoutFD, &chunk, chunk.count)
-
-            if readCount > 0 {
-                stdoutBuffer.append(contentsOf: chunk.prefix(readCount))
-                parseBufferedLines()
-                continue
-            }
-
-            if readCount == 0 {
-                if flushRemainder, !stdoutBuffer.isEmpty {
-                    processLine(stdoutBuffer)
-                    stdoutBuffer.removeAll(keepingCapacity: true)
-                }
-                return
-            }
-
-            if errno == EAGAIN || errno == EWOULDBLOCK {
-                return
-            }
-
-            throw ClientError.stdoutReadFailed(String(cString: strerror(errno)))
-        }
-    }
-
-    private func parseBufferedLines() {
         while let newlineIndex = stdoutBuffer.firstIndex(of: 0x0A) {
             var lineData = stdoutBuffer.prefix(upTo: newlineIndex)
             stdoutBuffer.removeSubrange(...newlineIndex)
@@ -309,23 +397,106 @@ private final class AppServerSession {
                 lineData = lineData.dropLast()
             }
 
-            processLine(lineData)
+            processLine(Data(lineData))
         }
     }
 
-    private func processLine(_ line: Data) {
-        guard !line.isEmpty else {
-            return
-        }
+    private func appendStderr(_ data: Data) {
+        stderrBuffer.append(data)
+    }
 
-        guard let object = try? JSONSerialization.jsonObject(with: line),
-              let dictionary = object as? [String: Any],
-              let id = parseRequestID(from: dictionary["id"])
+    private func processLine(_ line: Data) {
+        guard !line.isEmpty,
+              let object = try? JSONSerialization.jsonObject(with: line),
+              let dictionary = object as? [String: Any]
         else {
             return
         }
 
-        responseByID[id] = dictionary
+        if let response = makeResponsePayload(from: dictionary) {
+            timeoutTasks.removeValue(forKey: response.id)?.cancel()
+            pendingResponses.removeValue(forKey: response.id)?.resume(returning: response.payload)
+            return
+        }
+
+        if let method = dictionary["method"] as? String {
+            handleServerMessage(method: method)
+        }
+    }
+
+    private func makeResponsePayload(from dictionary: [String: Any]) -> (id: Int, payload: ResponsePayload)? {
+        guard let id = parseRequestID(from: dictionary["id"]) else {
+            return nil
+        }
+
+        if dictionary["result"] != nil || dictionary["error"] != nil {
+            let resultData = dictionary["result"].flatMap { try? JSONSerialization.data(withJSONObject: $0) }
+            let errorMessage = (dictionary["error"] as? [String: Any])?["message"] as? String
+            return (id, ResponsePayload(resultData: resultData, errorMessage: errorMessage))
+        }
+
+        return nil
+    }
+
+    private func handleServerMessage(method: String) {
+        guard let event = AppServerEvent(method: method) else {
+            return
+        }
+
+        eventSink(event)
+    }
+
+    private func handleProcessTermination(status: Int32) async {
+        guard process != nil else {
+            return
+        }
+
+        processTerminationReason = "exit status \(status)"
+        await handleTransportFailure(ClientError.processFailed(cachedStderrText()))
+    }
+
+    private func handleTransportFailure(_ error: Error) async {
+        let pending = pendingResponses
+        let timeouts = timeoutTasks
+
+        pendingResponses.removeAll()
+        timeoutTasks.removeAll()
+        stdoutBuffer.removeAll(keepingCapacity: true)
+        didSendInitialized = false
+
+        for task in timeouts.values {
+            task.cancel()
+        }
+
+        for continuation in pending.values {
+            continuation.resume(throwing: error)
+        }
+
+        stdoutSource?.cancel()
+        stderrSource?.cancel()
+        stdoutSource = nil
+        stderrSource = nil
+
+        if let process, process.isRunning {
+            process.terminate()
+        }
+
+        process = nil
+        stdinHandle = nil
+        stdoutHandle = nil
+        stderrHandle = nil
+    }
+
+    private func decodeResult<T: Decodable>(from response: ResponsePayload) throws -> T {
+        if let errorMessage = response.errorMessage {
+            throw ClientError.rpcError(errorMessage)
+        }
+
+        guard let resultData = response.resultData else {
+            throw ClientError.missingResult
+        }
+
+        return try jsonDecoder.decode(T.self, from: resultData)
     }
 
     private func parseRequestID(from value: Any?) -> Int? {
@@ -340,24 +511,45 @@ private final class AppServerSession {
         return nil
     }
 
-    private func cacheStderr() {
-        guard !didReadStderr else {
-            return
-        }
-
-        didReadStderr = true
-        let data = stderrHandle.readDataToEndOfFile()
-        if !data.isEmpty {
-            stderrCache.append(data)
-        }
-    }
-
     private func cachedStderrText() -> String {
-        cacheStderr()
+        let text = String(data: stderrBuffer, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        let text = String(data: stderrCache, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return text?.isEmpty == false ? text! : "Unknown app-server error"
+        if let text, !text.isEmpty {
+            return text
+        }
+
+        if let processTerminationReason {
+            return processTerminationReason
+        }
+
+        return "Unknown app-server error"
     }
+}
+
+enum AppServerEvent: Equatable, Sendable {
+    case sessionsChanged(reason: String)
+
+    init?(method: String) {
+        switch method {
+        case "thread/started",
+             "thread/status/changed",
+             "thread/archived",
+             "thread/unarchived",
+             "thread/closed",
+             "turn/started",
+             "turn/completed",
+             "serverRequest/resolved",
+             "error":
+            self = .sessionsChanged(reason: method)
+        default:
+            return nil
+        }
+    }
+}
+
+private struct ResponsePayload: Sendable {
+    let resultData: Data?
+    let errorMessage: String?
 }
 
 private struct RequestEnvelope<Params: Encodable>: Encodable {
@@ -365,6 +557,13 @@ private struct RequestEnvelope<Params: Encodable>: Encodable {
     let method: String
     let params: Params
 }
+
+private struct NotificationEnvelope<Params: Encodable>: Encodable {
+    let method: String
+    let params: Params
+}
+
+private struct EmptyParams: Encodable {}
 
 private struct InitializeParams: Encodable {
     let clientInfo: InitializeClientInfo
@@ -385,16 +584,12 @@ private struct InitializeResponse: Decodable {
     let userAgent: String
 }
 
-private struct ThreadLoadedListParams: Encodable {
-    let cursor: String?
-    let limit: Int
-}
-
 private struct ThreadListParams: Encodable {
     let cursor: String?
     let limit: Int
     let sortKey: String
     let archived: Bool
+    let sourceKinds: [SessionSourceKind]
 }
 
 private struct AnyEncodable: Encodable {
@@ -411,6 +606,7 @@ private struct AnyEncodable: Encodable {
 
 enum ClientError: LocalizedError {
     case codexNotFound
+    case disconnected
     case processLaunchFailed(String)
     case processFailed(String)
     case requestTimedOut(TimeInterval, String)
@@ -423,6 +619,8 @@ enum ClientError: LocalizedError {
         switch self {
         case .codexNotFound:
             return "Could not find the codex executable. Install Codex CLI or add it to PATH."
+        case .disconnected:
+            return "The Codex app-server connection is not available."
         case .processLaunchFailed(let reason):
             return "Failed to launch codex app-server: \(reason)"
         case .processFailed(let stderr):

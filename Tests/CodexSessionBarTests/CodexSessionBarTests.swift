@@ -3,46 +3,59 @@ import XCTest
 @testable import CodexSessionBar
 
 final class CodexSessionBarTests: XCTestCase {
-    func testSelectTrackedSessionsIncludesLoadedEvenIfOld() {
+    func testSelectTrackedSessionsIncludesLiveEvenIfOld() {
         let now = Date(timeIntervalSince1970: 1_000_000)
-        let stale = thread(id: "loaded-old", updatedAt: now.addingTimeInterval(-8 * 24 * 60 * 60).timeIntervalSince1970)
+        let stale = thread(
+            id: "live-old",
+            updatedAt: now.addingTimeInterval(-8 * 24 * 60 * 60).timeIntervalSince1970,
+            status: ThreadStatus(type: .idle)
+        )
 
         let sessions = CodexAppServerClient.selectTrackedSessions(
             threads: [stale],
-            loadedIDs: ["loaded-old"],
             now: now,
             recentWindow: 24 * 60 * 60
         )
 
         XCTAssertEqual(sessions.count, 1)
-        XCTAssertEqual(sessions[0].id, "loaded-old")
-        XCTAssertTrue(sessions[0].isLoaded)
+        XCTAssertEqual(sessions[0].id, "live-old")
+        XCTAssertTrue(sessions[0].isLive)
     }
 
-    func testSelectTrackedSessionsIncludesRecentAndExcludesOldUnloaded() {
+    func testSelectTrackedSessionsIncludesRecentStoredAndExcludesOldStored() {
         let now = Date(timeIntervalSince1970: 1_000_000)
-        let recent = thread(id: "recent", updatedAt: now.addingTimeInterval(-2 * 60 * 60).timeIntervalSince1970)
-        let old = thread(id: "old", updatedAt: now.addingTimeInterval(-3 * 24 * 60 * 60).timeIntervalSince1970)
+        let recent = thread(
+            id: "recent",
+            updatedAt: now.addingTimeInterval(-2 * 60 * 60).timeIntervalSince1970,
+            status: .notLoaded
+        )
+        let old = thread(
+            id: "old",
+            updatedAt: now.addingTimeInterval(-3 * 24 * 60 * 60).timeIntervalSince1970,
+            status: .notLoaded
+        )
 
         let sessions = CodexAppServerClient.selectTrackedSessions(
             threads: [old, recent],
-            loadedIDs: [],
             now: now,
             recentWindow: 24 * 60 * 60
         )
 
         XCTAssertEqual(sessions.count, 1)
         XCTAssertEqual(sessions[0].id, "recent")
-        XCTAssertFalse(sessions[0].isLoaded)
+        XCTAssertFalse(sessions[0].isLive)
     }
 
-    func testSelectTrackedSessionsReturnsEmptyWhenNothingLoadedOrRecent() {
+    func testSelectTrackedSessionsReturnsEmptyWhenNothingLiveOrRecent() {
         let now = Date(timeIntervalSince1970: 1_000_000)
-        let old = thread(id: "old", updatedAt: now.addingTimeInterval(-9 * 24 * 60 * 60).timeIntervalSince1970)
+        let old = thread(
+            id: "old",
+            updatedAt: now.addingTimeInterval(-9 * 24 * 60 * 60).timeIntervalSince1970,
+            status: .notLoaded
+        )
 
         let sessions = CodexAppServerClient.selectTrackedSessions(
             threads: [old],
-            loadedIDs: [],
             now: now,
             recentWindow: 24 * 60 * 60
         )
@@ -50,10 +63,10 @@ final class CodexSessionBarTests: XCTestCase {
         XCTAssertTrue(sessions.isEmpty)
     }
 
-    func testCollectAllPagesTraversesCursors() {
+    func testCollectAllPagesTraversesCursors() async throws {
         var seenCursors: [String?] = []
 
-        let collected = CodexAppServerClient.collectAllPages { cursor in
+        let collected = await CodexAppServerClient.collectAllPages { cursor in
             seenCursors.append(cursor)
 
             switch cursor {
@@ -76,10 +89,10 @@ final class CodexSessionBarTests: XCTestCase {
         XCTAssertEqual(seenCursors[2], "cursor-2")
     }
 
-    func testCollectAllPagesStopsOnEmptyCursor() {
+    func testCollectAllPagesStopsOnEmptyCursor() async throws {
         var calls = 0
 
-        let collected = CodexAppServerClient.collectAllPages { _ in
+        let collected = await CodexAppServerClient.collectAllPages { _ in
             calls += 1
             return (data: [1, 2], nextCursor: "")
         }
@@ -88,14 +101,32 @@ final class CodexSessionBarTests: XCTestCase {
         XCTAssertEqual(collected, [1, 2])
     }
 
-    private func thread(id: String, updatedAt: TimeInterval) -> CodexThread {
+    func testThreadListFilterValuesExcludeUnknown() {
+        XCTAssertFalse(SessionSourceKind.threadListFilterValues.contains(.unknown))
+        XCTAssertTrue(SessionSourceKind.threadListFilterValues.contains(.cli))
+        XCTAssertTrue(SessionSourceKind.threadListFilterValues.contains(.appServer))
+    }
+
+    func testAppServerEventMapsThreadAndTurnNotificationsToRefreshes() {
+        XCTAssertEqual(AppServerEvent(method: "thread/status/changed"), .sessionsChanged(reason: "thread/status/changed"))
+        XCTAssertEqual(AppServerEvent(method: "turn/completed"), .sessionsChanged(reason: "turn/completed"))
+        XCTAssertNil(AppServerEvent(method: "item/agentMessage/delta"))
+    }
+
+    func testSessionSourceKindDecodesLegacySubAgentObject() throws {
+        let data = Data(#"{"subAgent":"review"}"#.utf8)
+        let decoded = try JSONDecoder().decode(SessionSourceKind.self, from: data)
+        XCTAssertEqual(decoded, .subAgentReview)
+    }
+
+    private func thread(id: String, updatedAt: TimeInterval, status: ThreadStatus) -> CodexThread {
         CodexThread(
             id: id,
             preview: "Preview \(id)",
             modelProvider: "openai",
             createdAt: updatedAt - 300,
             updatedAt: updatedAt,
-            status: nil,
+            status: status,
             path: nil,
             cwd: "/tmp",
             source: .cli

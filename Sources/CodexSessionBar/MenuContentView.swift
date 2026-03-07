@@ -94,7 +94,7 @@ struct MenuContentView: View {
 
                 Text("• \(session.activityLabel)")
                     .font(.caption2)
-                    .foregroundStyle(session.isLoaded ? .green : .secondary)
+                    .foregroundStyle(session.isLive ? .green : .secondary)
 
                 Spacer()
 
