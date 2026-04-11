@@ -2,51 +2,82 @@ import Darwin
 import Foundation
 
 actor CodexAppServerClient {
-    private let requestTimeout: TimeInterval = 8
+    private let requestTimeout: TimeInterval = 15
     private var connection: AppServerConnection?
     private var eventContinuations: [UUID: AsyncStream<AppServerEvent>.Continuation] = [:]
 
-    func fetchActiveSessions() async throws -> [ActiveSession] {
+    func fetchModels() async throws -> [CodexModel] {
+        let connection = try await sharedConnection()
+        let models = try await Self.collectAllPages { cursor in
+            try await connection.listModels(cursor: cursor)
+        }
+
+        return models
+            .filter { !$0.hidden }
+            .sorted { lhs, rhs in
+                if lhs.isDefault != rhs.isDefault {
+                    return lhs.isDefault && !rhs.isDefault
+                }
+
+                return lhs.displayName.localizedStandardCompare(rhs.displayName) == .orderedAscending
+            }
+    }
+
+    func fetchSessions() async throws -> [SessionSummary] {
         let connection = try await sharedConnection()
         let threads = try await Self.collectAllPages { cursor in
             try await connection.listThreads(cursor: cursor)
         }
 
-        return Self.selectTrackedSessions(
-            threads: threads,
-            now: Date(),
-            recentWindow: 24 * 60 * 60
-        )
+        return threads
+            .map(\.sessionSummary)
+            .sorted { lhs, rhs in
+                lhs.updatedAt > rhs.updatedAt
+            }
     }
 
-    private func sharedConnection() async throws -> AppServerConnection {
-        if let connection {
-            return connection
-        }
+    func fetchThreadRecord(threadID: String) async throws -> SessionRecord {
+        let connection = try await sharedConnection()
+        let response = try await connection.readThread(id: threadID)
+        return response.thread.sessionRecord
+    }
 
-        guard let codexExecutable = resolveCodexExecutable() else {
-            throw ClientError.codexNotFound
-        }
+    func startThread(cwd: String, model: String?, serviceTier: ServiceTierValue?) async throws -> SessionSummary {
+        let connection = try await sharedConnection()
+        let response = try await connection.startThread(cwd: cwd, model: model, serviceTier: serviceTier)
+        return response.thread.sessionSummary
+    }
 
-        let connection = AppServerConnection(
-            codexExecutable: codexExecutable,
-            requestTimeout: requestTimeout,
-            eventSink: { [weak self] event in
-                Task {
-                    await self?.broadcast(event)
-                }
-            }
+    func resumeThread(id: String, cwd: String?, model: String?, serviceTier: ServiceTierValue?) async throws -> SessionRecord {
+        let connection = try await sharedConnection()
+        let response = try await connection.resumeThread(id: id, cwd: cwd, model: model, serviceTier: serviceTier)
+        return response.thread.sessionRecord
+    }
+
+    func startTurn(
+        threadID: String,
+        prompt: String,
+        cwd: String?,
+        model: String?,
+        effort: ReasoningEffortValue?,
+        serviceTier: ServiceTierValue?
+    ) async throws -> String {
+        let connection = try await sharedConnection()
+        let response = try await connection.startTurn(
+            threadID: threadID,
+            prompt: prompt,
+            cwd: cwd,
+            model: model,
+            effort: effort,
+            serviceTier: serviceTier
         )
-        self.connection = connection
-        return connection
+        return response.turn.id
     }
 
     func eventStream() -> AsyncStream<AppServerEvent> {
         AsyncStream { continuation in
             let id = UUID()
-            Task {
-                self.addEventContinuation(continuation, id: id)
-            }
+            addEventContinuation(continuation, id: id)
 
             continuation.onTermination = { [weak self] _ in
                 Task {
@@ -76,33 +107,26 @@ actor CodexAppServerClient {
         return allItems
     }
 
-    static func selectTrackedSessions(
-        threads: [CodexThread],
-        now: Date,
-        recentWindow: TimeInterval
-    ) -> [ActiveSession] {
-        let recentCutoff = now.addingTimeInterval(-recentWindow)
-
-        let trackedThreads = threads.filter { thread in
-            let updatedDate = Date(timeIntervalSince1970: thread.updatedAt)
-            return thread.runtimeStatus.isLoaded || updatedDate >= recentCutoff
+    private func sharedConnection() async throws -> AppServerConnection {
+        if let connection {
+            return connection
         }
 
-        let sessions = trackedThreads.map { thread in
-            ActiveSession(
-                id: thread.id,
-                preview: thread.preview,
-                cwd: thread.cwd,
-                path: thread.path,
-                modelProvider: thread.modelProvider,
-                source: thread.source,
-                createdAt: Date(timeIntervalSince1970: thread.createdAt),
-                updatedAt: Date(timeIntervalSince1970: thread.updatedAt),
-                runtimeStatus: thread.runtimeStatus
-            )
+        guard let codexExecutable = resolveCodexExecutable() else {
+            throw ClientError.codexNotFound
         }
 
-        return sessions.sorted { $0.updatedAt > $1.updatedAt }
+        let connection = AppServerConnection(
+            codexExecutable: codexExecutable,
+            requestTimeout: requestTimeout,
+            eventSink: { [weak self] event in
+                Task {
+                    await self?.broadcast(event)
+                }
+            }
+        )
+        self.connection = connection
+        return connection
     }
 
     private func resolveCodexExecutable() -> String? {
@@ -148,6 +172,7 @@ private actor AppServerConnection {
     private let codexExecutable: String
     private let requestTimeout: TimeInterval
     private let jsonDecoder = JSONDecoder()
+    private let jsonEncoder = JSONEncoder()
     private let eventSink: @Sendable (AppServerEvent) -> Void
 
     private var process: Process?
@@ -180,13 +205,92 @@ private actor AppServerConnection {
             method: "thread/list",
             params: ThreadListParams(
                 cursor: cursor,
-                limit: 250,
+                limit: 200,
                 sortKey: "updated_at",
+                modelProviders: nil,
+                sourceKinds: SessionSourceKind.threadListFilterValues,
                 archived: false,
-                sourceKinds: SessionSourceKind.threadListFilterValues
+                cwd: nil,
+                searchTerm: nil
             )
         )
         return (response.data, response.nextCursor)
+    }
+
+    func listModels(cursor: String?) async throws -> (data: [CodexModel], nextCursor: String?) {
+        let response: ModelListResponse = try await sendRequest(
+            method: "model/list",
+            params: ModelListParams(
+                cursor: cursor,
+                includeHidden: false,
+                limit: 100
+            )
+        )
+        return (response.data, response.nextCursor)
+    }
+
+    func readThread(id: String) async throws -> ThreadReadResponse {
+        try await sendRequest(
+            method: "thread/read",
+            params: ThreadReadParams(threadId: id, includeTurns: true)
+        )
+    }
+
+    func startThread(cwd: String, model: String?, serviceTier: ServiceTierValue?) async throws -> ThreadStartResponse {
+        try await sendRequest(
+            method: "thread/start",
+            params: ThreadStartParams(
+                model: model,
+                cwd: cwd,
+                approvalPolicy: "never",
+                sandbox: "workspace-write",
+                experimentalRawEvents: false,
+                persistExtendedHistory: true,
+                serviceTier: serviceTier
+            )
+        )
+    }
+
+    func resumeThread(
+        id: String,
+        cwd: String?,
+        model: String?,
+        serviceTier: ServiceTierValue?
+    ) async throws -> ThreadResumeResponse {
+        try await sendRequest(
+            method: "thread/resume",
+            params: ThreadResumeParams(
+                threadId: id,
+                model: model,
+                cwd: cwd,
+                approvalPolicy: "never",
+                sandbox: "workspace-write",
+                persistExtendedHistory: true,
+                serviceTier: serviceTier
+            )
+        )
+    }
+
+    func startTurn(
+        threadID: String,
+        prompt: String,
+        cwd: String?,
+        model: String?,
+        effort: ReasoningEffortValue?,
+        serviceTier: ServiceTierValue?
+    ) async throws -> TurnStartResponse {
+        try await sendRequest(
+            method: "turn/start",
+            params: TurnStartParams(
+                threadId: threadID,
+                input: [.text(prompt)],
+                cwd: cwd,
+                approvalPolicy: "never",
+                model: model,
+                effort: effort,
+                serviceTier: serviceTier
+            )
+        )
     }
 
     private func sendRequest<Params: Encodable, Response: Decodable>(
@@ -198,7 +302,7 @@ private actor AppServerConnection {
         let id = nextRequestID
         nextRequestID += 1
 
-        let payload = try JSONEncoder().encode(AnyEncodable(RequestEnvelope(id: id, method: method, params: params)))
+        let payload = try jsonEncoder.encode(AnyEncodable(RequestEnvelope(id: id, method: method, params: params)))
         let response = try await sendPayload(payload, id: id)
         return try decodeResult(from: response)
     }
@@ -212,7 +316,7 @@ private actor AppServerConnection {
 
         do {
             let initializeResponse = try await sendPayload(
-                JSONEncoder().encode(
+                jsonEncoder.encode(
                     AnyEncodable(
                         RequestEnvelope(
                             id: nextRequestID,
@@ -220,8 +324,8 @@ private actor AppServerConnection {
                             params: InitializeParams(
                                 clientInfo: InitializeClientInfo(
                                     name: "codex-session-bar",
-                                    title: "Codex Session Bar",
-                                    version: "0.4.0"
+                                    title: "Codex Mini Sessions",
+                                    version: "1.0.0"
                                 ),
                                 capabilities: InitializeCapabilities(experimentalApi: true)
                             )
@@ -354,7 +458,27 @@ private actor AppServerConnection {
             throw ClientError.disconnected
         }
 
-        let payload = try JSONEncoder().encode(AnyEncodable(NotificationEnvelope(method: method, params: params)))
+        let payload = try jsonEncoder.encode(AnyEncodable(NotificationEnvelope(method: method, params: params)))
+        stdinHandle.write(payload)
+        stdinHandle.write(Data([0x0A]))
+    }
+
+    private func sendServerResponse<Result: Encodable>(id: Int, result: Result) throws {
+        guard let stdinHandle else {
+            throw ClientError.disconnected
+        }
+
+        let payload = try jsonEncoder.encode(AnyEncodable(ResponseEnvelope(id: id, result: result)))
+        stdinHandle.write(payload)
+        stdinHandle.write(Data([0x0A]))
+    }
+
+    private func sendServerError(id: Int, message: String) throws {
+        guard let stdinHandle else {
+            throw ClientError.disconnected
+        }
+
+        let payload = try jsonEncoder.encode(AnyEncodable(ErrorResponseEnvelope(id: id, error: RPCError(message: message))))
         stdinHandle.write(payload)
         stdinHandle.write(Data([0x0A]))
     }
@@ -419,8 +543,23 @@ private actor AppServerConnection {
             return
         }
 
-        if let method = dictionary["method"] as? String {
-            handleServerMessage(method: method)
+        guard let method = dictionary["method"] as? String else {
+            return
+        }
+
+        let paramsData: Data?
+        if let params = dictionary["params"] {
+            paramsData = try? JSONSerialization.data(withJSONObject: params)
+        } else {
+            paramsData = nil
+        }
+
+        if let id = parseRequestID(from: dictionary["id"]) {
+            Task {
+                await handleServerRequest(id: id, method: method, paramsData: paramsData)
+            }
+        } else {
+            handleServerNotification(method: method, paramsData: paramsData)
         }
     }
 
@@ -438,12 +577,146 @@ private actor AppServerConnection {
         return nil
     }
 
-    private func handleServerMessage(method: String) {
-        guard let event = AppServerEvent(method: method) else {
-            return
+    private func handleServerNotification(method: String, paramsData: Data?) {
+        switch method {
+        case "thread/started",
+             "thread/status/changed",
+             "thread/archived",
+             "thread/unarchived",
+             "thread/closed",
+             "thread/name/updated",
+             "thread/tokenUsage/updated":
+            eventSink(.sessionsChanged(reason: method))
+
+        case "turn/started":
+            if let payload: TurnLifecyclePayload = decodePayload(from: paramsData) {
+                eventSink(.turnStarted(threadID: payload.threadId, turnID: payload.turn.id))
+            }
+            eventSink(.sessionsChanged(reason: method))
+
+        case "turn/completed":
+            if let payload: TurnLifecyclePayload = decodePayload(from: paramsData) {
+                eventSink(.turnCompleted(threadID: payload.threadId, turnID: payload.turn.id))
+            }
+            eventSink(.sessionsChanged(reason: method))
+
+        case "item/agentMessage/delta":
+            if let payload: AgentMessageDeltaPayload = decodePayload(from: paramsData) {
+                eventSink(
+                    .agentMessageDelta(
+                        threadID: payload.threadId,
+                        turnID: payload.turnId,
+                        itemID: payload.itemId,
+                        delta: payload.delta
+                    )
+                )
+            }
+
+        case "error":
+            let message = decodePayload(from: paramsData, as: ErrorNotificationPayload.self)?.message ?? "Unknown app-server error."
+            eventSink(.error(message))
+
+        case "serverRequest/resolved",
+             "item/completed",
+             "thread/compacted",
+             "configWarning":
+            eventSink(.sessionsChanged(reason: method))
+
+        default:
+            break
+        }
+    }
+
+    private func handleServerRequest(id: Int, method: String, paramsData: Data?) async {
+        do {
+            switch method {
+            case "item/commandExecution/requestApproval":
+                let payload: CommandExecutionApprovalRequestPayload = decodePayload(from: paramsData) ?? .empty
+                try sendServerResponse(id: id, result: CommandExecutionApprovalDecisionPayload(decision: "decline"))
+                eventSink(.serverNotice(threadID: payload.threadId, tone: .warning, message: "A command execution request was declined in the mini window shell."))
+
+            case "item/fileChange/requestApproval":
+                let payload: FileChangeApprovalRequestPayload = decodePayload(from: paramsData) ?? .empty
+                try sendServerResponse(id: id, result: FileChangeApprovalDecisionPayload(decision: "decline"))
+                eventSink(.serverNotice(threadID: payload.threadId, tone: .warning, message: "A file change request was declined in the mini window shell."))
+
+            case "item/permissions/requestApproval":
+                let payload: PermissionsRequestPayload = decodePayload(from: paramsData) ?? .empty
+                try sendServerResponse(id: id, result: PermissionsApprovalResponsePayload(permissions: EmptyPermissionsPayload(), scope: "turn"))
+                eventSink(.serverNotice(threadID: payload.threadId, tone: .warning, message: payload.reason ?? "Additional permissions were requested and denied."))
+
+            case "item/tool/requestUserInput":
+                let payload: ToolRequestUserInputRequestPayload = decodePayload(from: paramsData) ?? .empty
+                try sendServerResponse(id: id, result: ToolRequestUserInputResponsePayload(answers: [:]))
+                eventSink(.serverNotice(threadID: payload.threadId, tone: .warning, message: "Codex requested extra user input, but the mini window does not yet support interactive prompts."))
+
+            case "mcpServer/elicitation/request":
+                try sendServerResponse(id: id, result: McpServerElicitationResponsePayload(action: "cancel", content: nil, meta: nil))
+                eventSink(.serverNotice(threadID: nil, tone: .warning, message: "An MCP elicitation request was cancelled in the lightweight shell."))
+
+            case "item/tool/call":
+                let payload: DynamicToolCallRequestPayload = decodePayload(from: paramsData) ?? .empty
+                try sendServerResponse(
+                    id: id,
+                    result: DynamicToolCallResponsePayload(
+                        contentItems: [.init(type: "inputText", text: "Dynamic tool calls are not supported in the mini window shell yet.")],
+                        success: false
+                    )
+                )
+                eventSink(.serverNotice(threadID: payload.threadId, tone: .warning, message: "Codex attempted a dynamic tool call that this mini shell does not implement yet."))
+
+            case "account/chatgptAuthTokens/refresh":
+                try sendServerError(id: id, message: "Auth token refresh is not supported by this client.")
+
+            case "applyPatchApproval":
+                let payload: LegacyConversationPayload = decodePayload(from: paramsData) ?? .empty
+                try sendServerResponse(id: id, result: LegacyReviewDecisionPayload(decision: "denied"))
+                eventSink(.serverNotice(threadID: payload.conversationId, tone: .warning, message: "A patch approval request was denied in the mini window shell."))
+
+            case "execCommandApproval":
+                let payload: LegacyConversationPayload = decodePayload(from: paramsData) ?? .empty
+                try sendServerResponse(id: id, result: LegacyReviewDecisionPayload(decision: "denied"))
+                eventSink(.serverNotice(threadID: payload.conversationId, tone: .warning, message: "A command approval request was denied in the mini window shell."))
+
+            default:
+                try sendServerError(id: id, message: "Unsupported server request: \(method)")
+                eventSink(.serverNotice(threadID: nil, tone: .warning, message: "Unsupported app-server request: \(method)"))
+            }
+        } catch {
+            eventSink(.error("Failed to answer app-server request \(method): \(error.localizedDescription)"))
+        }
+    }
+
+    private func decodeResult<T: Decodable>(from response: ResponsePayload) throws -> T {
+        if let errorMessage = response.errorMessage {
+            throw ClientError.rpcError(errorMessage)
         }
 
-        eventSink(event)
+        guard let resultData = response.resultData else {
+            throw ClientError.missingResult
+        }
+
+        return try jsonDecoder.decode(T.self, from: resultData)
+    }
+
+    private func decodePayload<T: Decodable>(from paramsData: Data?, as type: T.Type = T.self) -> T? {
+        guard let paramsData else {
+            return nil
+        }
+
+        return try? jsonDecoder.decode(T.self, from: paramsData)
+    }
+
+    private func parseRequestID(from value: Any?) -> Int? {
+        if let id = value as? Int {
+            return id
+        }
+
+        if let idString = value as? String {
+            return Int(idString)
+        }
+
+        return nil
     }
 
     private func handleProcessTermination(status: Int32) async {
@@ -487,30 +760,6 @@ private actor AppServerConnection {
         stderrHandle = nil
     }
 
-    private func decodeResult<T: Decodable>(from response: ResponsePayload) throws -> T {
-        if let errorMessage = response.errorMessage {
-            throw ClientError.rpcError(errorMessage)
-        }
-
-        guard let resultData = response.resultData else {
-            throw ClientError.missingResult
-        }
-
-        return try jsonDecoder.decode(T.self, from: resultData)
-    }
-
-    private func parseRequestID(from value: Any?) -> Int? {
-        if let id = value as? Int {
-            return id
-        }
-
-        if let idString = value as? String {
-            return Int(idString)
-        }
-
-        return nil
-    }
-
     private func cachedStderrText() -> String {
         let text = String(data: stderrBuffer, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -528,23 +777,11 @@ private actor AppServerConnection {
 
 enum AppServerEvent: Equatable, Sendable {
     case sessionsChanged(reason: String)
-
-    init?(method: String) {
-        switch method {
-        case "thread/started",
-             "thread/status/changed",
-             "thread/archived",
-             "thread/unarchived",
-             "thread/closed",
-             "turn/started",
-             "turn/completed",
-             "serverRequest/resolved",
-             "error":
-            self = .sessionsChanged(reason: method)
-        default:
-            return nil
-        }
-    }
+    case turnStarted(threadID: String, turnID: String)
+    case turnCompleted(threadID: String, turnID: String)
+    case agentMessageDelta(threadID: String, turnID: String, itemID: String, delta: String)
+    case serverNotice(threadID: String?, tone: SessionBanner.Tone, message: String)
+    case error(String)
 }
 
 private struct ResponsePayload: Sendable {
@@ -561,6 +798,20 @@ private struct RequestEnvelope<Params: Encodable>: Encodable {
 private struct NotificationEnvelope<Params: Encodable>: Encodable {
     let method: String
     let params: Params
+}
+
+private struct ResponseEnvelope<Result: Encodable>: Encodable {
+    let id: Int
+    let result: Result
+}
+
+private struct ErrorResponseEnvelope: Encodable {
+    let id: Int
+    let error: RPCError
+}
+
+private struct RPCError: Encodable {
+    let message: String
 }
 
 private struct EmptyParams: Encodable {}
@@ -581,26 +832,261 @@ private struct InitializeCapabilities: Encodable {
 }
 
 private struct InitializeResponse: Decodable {
-    let userAgent: String
+    let userAgent: String?
 }
 
 private struct ThreadListParams: Encodable {
     let cursor: String?
     let limit: Int
     let sortKey: String
-    let archived: Bool
+    let modelProviders: [String]?
     let sourceKinds: [SessionSourceKind]
+    let archived: Bool
+    let cwd: String?
+    let searchTerm: String?
+}
+
+private struct ModelListParams: Encodable {
+    let cursor: String?
+    let includeHidden: Bool?
+    let limit: Int?
+}
+
+private struct ThreadReadParams: Encodable {
+    let threadId: String
+    let includeTurns: Bool
+}
+
+private struct ThreadStartParams: Encodable {
+    let model: String?
+    let modelProvider: String? = nil
+    let cwd: String?
+    let approvalPolicy: String?
+    let sandbox: String?
+    let config: [String: JSONValue]? = nil
+    let serviceName: String? = nil
+    let baseInstructions: String? = nil
+    let developerInstructions: String? = nil
+    let personality: String? = nil
+    let ephemeral: Bool? = nil
+    let experimentalRawEvents: Bool
+    let persistExtendedHistory: Bool
+    let serviceTier: ServiceTierValue?
+}
+
+private struct ThreadResumeParams: Encodable {
+    let threadId: String
+    let history: [JSONValue]? = nil
+    let path: String? = nil
+    let model: String?
+    let modelProvider: String? = nil
+    let cwd: String?
+    let approvalPolicy: String?
+    let sandbox: String?
+    let config: [String: JSONValue]? = nil
+    let baseInstructions: String? = nil
+    let developerInstructions: String? = nil
+    let personality: String? = nil
+    let persistExtendedHistory: Bool
+    let serviceTier: ServiceTierValue?
+}
+
+private struct TurnStartParams: Encodable {
+    let threadId: String
+    let input: [TurnUserInput]
+    let cwd: String?
+    let approvalPolicy: String?
+    let model: String?
+    let effort: ReasoningEffortValue?
+    let serviceTier: ServiceTierValue?
+}
+
+private enum TurnUserInput: Encodable {
+    case text(String)
+
+    func encode(to encoder: Encoder) throws {
+        switch self {
+        case .text(let text):
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode("text", forKey: .type)
+            try container.encode(text, forKey: .text)
+            try container.encode([String](), forKey: .textElements)
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case type
+        case text
+        case textElements = "text_elements"
+    }
+}
+
+private enum JSONValue: Encodable {
+    case string(String)
+    case number(Double)
+    case bool(Bool)
+    case null
+    case array([JSONValue])
+    case object([String: JSONValue])
+
+    func encode(to encoder: Encoder) throws {
+        switch self {
+        case .string(let value):
+            var container = encoder.singleValueContainer()
+            try container.encode(value)
+        case .number(let value):
+            var container = encoder.singleValueContainer()
+            try container.encode(value)
+        case .bool(let value):
+            var container = encoder.singleValueContainer()
+            try container.encode(value)
+        case .null:
+            var container = encoder.singleValueContainer()
+            try container.encodeNil()
+        case .array(let values):
+            var container = encoder.unkeyedContainer()
+            for value in values {
+                try container.encode(value)
+            }
+        case .object(let values):
+            var container = encoder.container(keyedBy: DynamicCodingKey.self)
+            for (key, value) in values {
+                try container.encode(value, forKey: DynamicCodingKey(stringValue: key))
+            }
+        }
+    }
 }
 
 private struct AnyEncodable: Encodable {
     private let encodeClosure: (Encoder) throws -> Void
 
     init<T: Encodable>(_ wrapped: T) {
-        self.encodeClosure = wrapped.encode(to:)
+        encodeClosure = wrapped.encode(to:)
     }
 
     func encode(to encoder: Encoder) throws {
         try encodeClosure(encoder)
+    }
+}
+
+private struct AgentMessageDeltaPayload: Decodable {
+    let threadId: String
+    let turnId: String
+    let itemId: String
+    let delta: String
+}
+
+private struct TurnLifecyclePayload: Decodable {
+    let threadId: String
+    let turn: TurnPayload
+}
+
+private struct TurnPayload: Decodable {
+    let id: String
+}
+
+private struct ErrorNotificationPayload: Decodable {
+    let message: String
+}
+
+private struct CommandExecutionApprovalRequestPayload: Decodable {
+    let threadId: String?
+
+    static let empty = CommandExecutionApprovalRequestPayload(threadId: nil)
+}
+
+private struct FileChangeApprovalRequestPayload: Decodable {
+    let threadId: String?
+
+    static let empty = FileChangeApprovalRequestPayload(threadId: nil)
+}
+
+private struct PermissionsRequestPayload: Decodable {
+    let threadId: String?
+    let reason: String?
+
+    static let empty = PermissionsRequestPayload(threadId: nil, reason: nil)
+}
+
+private struct ToolRequestUserInputRequestPayload: Decodable {
+    let threadId: String?
+
+    static let empty = ToolRequestUserInputRequestPayload(threadId: nil)
+}
+
+private struct DynamicToolCallRequestPayload: Decodable {
+    let threadId: String?
+
+    static let empty = DynamicToolCallRequestPayload(threadId: nil)
+}
+
+private struct LegacyConversationPayload: Decodable {
+    let conversationId: String?
+
+    static let empty = LegacyConversationPayload(conversationId: nil)
+}
+
+private struct CommandExecutionApprovalDecisionPayload: Encodable {
+    let decision: String
+}
+
+private struct FileChangeApprovalDecisionPayload: Encodable {
+    let decision: String
+}
+
+private struct PermissionsApprovalResponsePayload: Encodable {
+    let permissions: EmptyPermissionsPayload
+    let scope: String
+}
+
+private struct EmptyPermissionsPayload: Encodable {}
+
+private struct ToolRequestUserInputResponsePayload: Encodable {
+    let answers: [String: EmptyToolAnswerPayload]
+}
+
+private struct EmptyToolAnswerPayload: Encodable {}
+
+private struct McpServerElicitationResponsePayload: Encodable {
+    let action: String
+    let content: JSONValue?
+
+    enum CodingKeys: String, CodingKey {
+        case action
+        case content
+        case meta = "_meta"
+    }
+
+    let meta: JSONValue?
+}
+
+private struct DynamicToolCallResponsePayload: Encodable {
+    let contentItems: [DynamicToolCallOutputItemPayload]
+    let success: Bool
+}
+
+private struct DynamicToolCallOutputItemPayload: Encodable {
+    let type: String
+    let text: String?
+    let imageUrl: String? = nil
+}
+
+private struct LegacyReviewDecisionPayload: Encodable {
+    let decision: String
+}
+
+private struct DynamicCodingKey: CodingKey {
+    var stringValue: String
+    var intValue: Int?
+
+    init(stringValue: String) {
+        self.stringValue = stringValue
+        self.intValue = nil
+    }
+
+    init?(intValue: Int) {
+        self.stringValue = "\(intValue)"
+        self.intValue = intValue
     }
 }
 
@@ -618,17 +1104,17 @@ enum ClientError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .codexNotFound:
-            return "Could not find the codex executable. Install Codex CLI or add it to PATH."
+            return "Could not find the `codex` executable. Install the Codex CLI or add it to `PATH`."
         case .disconnected:
             return "The Codex app-server connection is not available."
         case .processLaunchFailed(let reason):
-            return "Failed to launch codex app-server: \(reason)"
+            return "Failed to launch `codex app-server`: \(reason)"
         case .processFailed(let stderr):
-            return "codex app-server exited with an error: \(stderr)"
+            return "`codex app-server` exited with an error: \(stderr)"
         case .requestTimedOut(let seconds, let stderr):
-            return "codex app-server timed out after \(Int(seconds))s: \(stderr)"
+            return "`codex app-server` timed out after \(Int(seconds))s: \(stderr)"
         case .stdoutSetupFailed:
-            return "Failed to configure app-server output stream."
+            return "Failed to configure the app-server output stream."
         case .stdoutReadFailed(let reason):
             return "Failed to read app-server output: \(reason)"
         case .missingResult:

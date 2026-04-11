@@ -2,20 +2,14 @@ import SwiftUI
 
 @main
 struct CodexSessionBarApp: App {
-    @StateObject private var store = SessionStore()
+    @State private var model = CodexMiniAppModel()
 
     var body: some Scene {
         MenuBarExtra {
-            MenuContentView(store: store)
+            MenuLaunchpadView(model: model)
         } label: {
-            Label(store.menuBarTitle, systemImage: store.menuBarSymbol)
+            Label(model.menuBarTitle, systemImage: model.menuBarSymbol)
         }
         .menuBarExtraStyle(.window)
-
-        WindowGroup("Codex Sessions", id: "tracker") {
-            TrackerWindowView(store: store)
-                .frame(minWidth: 820, minHeight: 520)
-        }
-        .defaultSize(width: 1000, height: 640)
     }
 }

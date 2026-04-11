@@ -3,64 +3,39 @@ import XCTest
 @testable import CodexSessionBar
 
 final class CodexSessionBarTests: XCTestCase {
-    func testSelectTrackedSessionsIncludesLiveEvenIfOld() {
-        let now = Date(timeIntervalSince1970: 1_000_000)
-        let stale = thread(
-            id: "live-old",
-            updatedAt: now.addingTimeInterval(-8 * 24 * 60 * 60).timeIntervalSince1970,
-            status: ThreadStatus(type: .idle)
-        )
-
-        let sessions = CodexAppServerClient.selectTrackedSessions(
-            threads: [stale],
-            now: now,
-            recentWindow: 24 * 60 * 60
-        )
-
-        XCTAssertEqual(sessions.count, 1)
-        XCTAssertEqual(sessions[0].id, "live-old")
-        XCTAssertTrue(sessions[0].isLive)
+    override func tearDown() {
+        super.tearDown()
     }
 
-    func testSelectTrackedSessionsIncludesRecentStoredAndExcludesOldStored() {
-        let now = Date(timeIntervalSince1970: 1_000_000)
-        let recent = thread(
-            id: "recent",
-            updatedAt: now.addingTimeInterval(-2 * 60 * 60).timeIntervalSince1970,
-            status: .notLoaded
-        )
-        let old = thread(
-            id: "old",
-            updatedAt: now.addingTimeInterval(-3 * 24 * 60 * 60).timeIntervalSince1970,
-            status: .notLoaded
+    func testSessionSummaryUsesNameBeforePreview() {
+        let thread = makeThread(
+            id: "named",
+            preview: "Fallback preview",
+            name: "Named session",
+            turns: []
         )
 
-        let sessions = CodexAppServerClient.selectTrackedSessions(
-            threads: [old, recent],
-            now: now,
-            recentWindow: 24 * 60 * 60
-        )
-
-        XCTAssertEqual(sessions.count, 1)
-        XCTAssertEqual(sessions[0].id, "recent")
-        XCTAssertFalse(sessions[0].isLive)
+        XCTAssertEqual(thread.sessionSummary.title, "Named session")
     }
 
-    func testSelectTrackedSessionsReturnsEmptyWhenNothingLiveOrRecent() {
-        let now = Date(timeIntervalSince1970: 1_000_000)
-        let old = thread(
-            id: "old",
-            updatedAt: now.addingTimeInterval(-9 * 24 * 60 * 60).timeIntervalSince1970,
-            status: .notLoaded
-        )
+    func testSessionSummarySearchMatchesMultipleFields() {
+        let summary = makeThread(
+            id: "thread-123",
+            preview: "Investigate menu bar behavior",
+            name: "Menu audit",
+            turns: []
+        ).sessionSummary
 
-        let sessions = CodexAppServerClient.selectTrackedSessions(
-            threads: [old],
-            now: now,
-            recentWindow: 24 * 60 * 60
-        )
+        XCTAssertTrue(summary.matches(searchQuery: "audit"))
+        XCTAssertTrue(summary.matches(searchQuery: "thread-123"))
+        XCTAssertTrue(summary.matches(searchQuery: "main"))
+        XCTAssertFalse(summary.matches(searchQuery: "android"))
+    }
 
-        XCTAssertTrue(sessions.isEmpty)
+    func testThreadListFilterValuesCoverInteractiveSources() {
+        XCTAssertTrue(SessionSourceKind.threadListFilterValues.contains(.cli))
+        XCTAssertTrue(SessionSourceKind.threadListFilterValues.contains(.appServer))
+        XCTAssertTrue(SessionSourceKind.threadListFilterValues.contains(.subAgent(.generic)))
     }
 
     func testCollectAllPagesTraversesCursors() async throws {
@@ -101,35 +76,301 @@ final class CodexSessionBarTests: XCTestCase {
         XCTAssertEqual(collected, [1, 2])
     }
 
-    func testThreadListFilterValuesExcludeUnknown() {
-        XCTAssertFalse(SessionSourceKind.threadListFilterValues.contains(.unknown))
-        XCTAssertTrue(SessionSourceKind.threadListFilterValues.contains(.cli))
-        XCTAssertTrue(SessionSourceKind.threadListFilterValues.contains(.appServer))
+    func testSessionRecordBuildsConversationFromThreadItems() {
+        let turn = CodexTurn(
+            id: "turn-1",
+            items: [
+                .userMessage(ThreadUserMessageItem(id: "u1", content: [.text("Build a menu bar app")])),
+                .agentMessage(ThreadAgentMessageItem(id: "a1", text: "I can help with that.")),
+                .commandExecution(
+                    ThreadCommandExecutionItem(
+                        id: "c1",
+                        command: "swift build",
+                        cwd: "/tmp/project",
+                        status: .completed,
+                        aggregatedOutput: "Build complete",
+                        exitCode: 0
+                    )
+                )
+            ],
+            status: .completed,
+            error: nil
+        )
+
+        let record = makeThread(id: "thread-1", preview: "Build a menu bar app", name: nil, turns: [turn]).sessionRecord
+
+        XCTAssertEqual(record.conversation.map(\.kind), [.user, .assistant, .tool])
+        XCTAssertEqual(record.conversation[0].body, "Build a menu bar app")
+        XCTAssertEqual(record.conversation[1].body, "I can help with that.")
+        XCTAssertEqual(record.conversation[2].title, "$ swift build")
     }
 
-    func testAppServerEventMapsThreadAndTurnNotificationsToRefreshes() {
-        XCTAssertEqual(AppServerEvent(method: "thread/status/changed"), .sessionsChanged(reason: "thread/status/changed"))
-        XCTAssertEqual(AppServerEvent(method: "turn/completed"), .sessionsChanged(reason: "turn/completed"))
-        XCTAssertNil(AppServerEvent(method: "item/agentMessage/delta"))
+    func testThreadRecordDecodesCurrentFileChangeKindShape() throws {
+        let payload = """
+        {
+          "thread": {
+            "id": "thread-live",
+            "preview": "Debug selector",
+            "ephemeral": false,
+            "modelProvider": "openai",
+            "createdAt": 1000000,
+            "updatedAt": 1000360,
+            "status": { "type": "notLoaded" },
+            "path": null,
+            "cwd": "/tmp/project",
+            "cliVersion": "1.0.0",
+            "source": "cli",
+            "agentNickname": null,
+            "agentRole": null,
+            "gitInfo": { "sha": null, "branch": "main", "originUrl": null },
+            "name": "Live thread",
+            "turns": [
+              {
+                "id": "turn-1",
+                "status": "completed",
+                "error": null,
+                "items": [
+                  {
+                    "type": "userMessage",
+                    "id": "item-1",
+                    "content": [
+                      { "type": "text", "text": "hello", "text_elements": [] }
+                    ]
+                  },
+                  {
+                    "type": "fileChange",
+                    "id": "item-2",
+                    "changes": [
+                      {
+                        "path": "/tmp/project/file.swift",
+                        "kind": { "type": "update", "move_path": null },
+                        "diff": "@@"
+                      }
+                    ],
+                    "status": "completed"
+                  },
+                  {
+                    "type": "agentMessage",
+                    "id": "item-3",
+                    "text": "world"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+        """.data(using: .utf8)!
+
+        let response = try JSONDecoder().decode(ThreadReadResponse.self, from: payload)
+        let conversation = response.thread.sessionRecord.conversation
+
+        XCTAssertEqual(conversation.map(\.kind), [.user, .tool, .assistant])
+        XCTAssertEqual(conversation[0].body, "hello")
+        XCTAssertEqual(conversation[1].title, "File changes")
+        XCTAssertEqual(conversation[2].body, "world")
     }
 
-    func testSessionSourceKindDecodesLegacySubAgentObject() throws {
-        let data = Data(#"{"subAgent":"review"}"#.utf8)
-        let decoded = try JSONDecoder().decode(SessionSourceKind.self, from: data)
-        XCTAssertEqual(decoded, .subAgentReview)
+    func testTurnDecodingSkipsMalformedItemsInsteadOfDroppingWholeTurn() throws {
+        let payload = """
+        {
+          "id": "turn-1",
+          "status": "completed",
+          "error": null,
+          "items": [
+            {
+              "type": "userMessage",
+              "id": "item-1",
+              "content": [
+                { "type": "text", "text": "before", "text_elements": [] }
+              ]
+            },
+            {
+              "type": "fileChange",
+              "id": "item-bad",
+              "changes": "not-an-array",
+              "status": "completed"
+            },
+            {
+              "type": "agentMessage",
+              "id": "item-2",
+              "text": "after"
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let turn = try JSONDecoder().decode(CodexTurn.self, from: payload)
+        let conversation = turn.conversationEntries
+
+        XCTAssertEqual(conversation.map(\.kind), [.user, .assistant])
+        XCTAssertEqual(conversation[0].body, "before")
+        XCTAssertEqual(conversation[1].body, "after")
     }
 
-    private func thread(id: String, updatedAt: TimeInterval, status: ThreadStatus) -> CodexThread {
+    func testChatWindowRouteParsesThreadIdentifier() {
+        let route = ChatWindowRoute.thread("thread-123")
+        XCTAssertEqual(route.threadID, "thread-123")
+        XCTAssertTrue(ChatWindowRoute.draft().threadID == nil)
+    }
+
+    @MainActor
+    func testDisplayedSessionRoutePreservesSelectedThread() {
+        let model = CodexMiniAppModel(autostart: false)
+        let older = makeThread(
+            id: "thread-older",
+            preview: "Older preview",
+            name: "Older",
+            turns: []
+        ).sessionSummary
+        let newer = makeThread(
+            id: "thread-newer",
+            preview: "Newer preview",
+            name: "Newer",
+            turns: []
+        ).sessionSummary
+
+        model.merge(summary: older)
+        model.merge(summary: newer)
+        model.selectSession(.thread(older.id))
+
+        XCTAssertEqual(model.displayedSessionRoute.threadID, older.id)
+
+        model.merge(summary: newer)
+
+        XCTAssertEqual(model.displayedSessionRoute.threadID, older.id)
+    }
+
+    @MainActor
+    func testDisplayedSessionRoutePreservesDraftSelection() {
+        let model = CodexMiniAppModel(autostart: false)
+        let session = makeThread(
+            id: "thread-1",
+            preview: "Session preview",
+            name: "Session",
+            turns: []
+        ).sessionSummary
+
+        model.merge(summary: session)
+        model.createFreshSession()
+
+        XCTAssertNil(model.displayedSessionRoute.threadID)
+    }
+
+    func testThreadHydrationNeededWhenNoCachedSummaryExists() {
+        let latestSummary = makeThread(
+            id: "thread-1",
+            preview: "Session preview",
+            name: "Session",
+            turns: []
+        ).sessionSummary
+
+        XCTAssertTrue(
+            CodexMiniAppModel.shouldHydrateThreadRecord(
+                cachedSummary: nil,
+                latestSummary: latestSummary
+            )
+        )
+    }
+
+    func testThreadHydrationNeededWhenCachedSummaryIsStale() {
+        let staleSummary = makeThread(
+            id: "thread-1",
+            preview: "Older preview",
+            name: "Session",
+            turns: []
+        ).sessionSummary
+        let latestSummary = SessionSummary(
+            id: staleSummary.id,
+            name: staleSummary.name,
+            preview: staleSummary.preview,
+            cwd: staleSummary.cwd,
+            path: staleSummary.path,
+            modelProvider: staleSummary.modelProvider,
+            source: staleSummary.source,
+            createdAt: staleSummary.createdAt,
+            updatedAt: staleSummary.updatedAt.addingTimeInterval(60),
+            status: staleSummary.status,
+            isEphemeral: staleSummary.isEphemeral,
+            agentNickname: staleSummary.agentNickname,
+            agentRole: staleSummary.agentRole,
+            gitBranch: staleSummary.gitBranch
+        )
+
+        XCTAssertTrue(
+            CodexMiniAppModel.shouldHydrateThreadRecord(
+                cachedSummary: staleSummary,
+                latestSummary: latestSummary
+            )
+        )
+    }
+
+    func testThreadHydrationSkippedWhenCachedSummaryMatchesLatestSummary() {
+        let latestSummary = makeThread(
+            id: "thread-1",
+            preview: "Session preview",
+            name: "Session",
+            turns: []
+        ).sessionSummary
+
+        XCTAssertFalse(
+            CodexMiniAppModel.shouldHydrateThreadRecord(
+                cachedSummary: latestSummary,
+                latestSummary: latestSummary
+            )
+        )
+    }
+
+    @MainActor
+    func testComposerPreferencesRoundTripSelections() {
+        let defaults = UserDefaults(suiteName: #function)!
+        defaults.removePersistentDomain(forName: #function)
+
+        ComposerPreferences.setSelectedModel("gpt-5.4", in: defaults)
+        ComposerPreferences.setSelectedReasoningEffort(.xhigh, in: defaults)
+        ComposerPreferences.setFastModeEnabled(true, in: defaults)
+
+        XCTAssertEqual(ComposerPreferences.selectedModel(in: defaults), "gpt-5.4")
+        XCTAssertEqual(ComposerPreferences.selectedReasoningEffort(in: defaults), .xhigh)
+        XCTAssertTrue(ComposerPreferences.fastModeEnabled(in: defaults))
+    }
+
+    @MainActor
+    func testComposerPreferencesClearSelections() {
+        let defaults = UserDefaults(suiteName: #function)!
+        defaults.removePersistentDomain(forName: #function)
+
+        ComposerPreferences.setSelectedModel("gpt-5.4", in: defaults)
+        ComposerPreferences.setSelectedReasoningEffort(.high, in: defaults)
+        ComposerPreferences.setSelectedModel(nil, in: defaults)
+        ComposerPreferences.setSelectedReasoningEffort(nil, in: defaults)
+
+        XCTAssertNil(ComposerPreferences.selectedModel(in: defaults))
+        XCTAssertNil(ComposerPreferences.selectedReasoningEffort(in: defaults))
+    }
+
+    private func makeThread(
+        id: String,
+        preview: String,
+        name: String?,
+        turns: [CodexTurn]
+    ) -> CodexThread {
         CodexThread(
             id: id,
-            preview: "Preview \(id)",
+            preview: preview,
+            ephemeral: false,
             modelProvider: "openai",
-            createdAt: updatedAt - 300,
-            updatedAt: updatedAt,
-            status: status,
+            createdAt: 1_000_000,
+            updatedAt: 1_000_360,
+            status: .idle,
             path: nil,
-            cwd: "/tmp",
-            source: .cli
+            cwd: "/tmp/project",
+            cliVersion: "1.0.0",
+            source: .cli,
+            agentNickname: nil,
+            agentRole: nil,
+            gitInfo: GitInfo(sha: nil, branch: "main", originUrl: nil),
+            name: name,
+            turns: turns
         )
     }
 }

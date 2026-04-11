@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "CodexSessionBar",
     platforms: [
-        .macOS(.v14)
+        .macOS(.v15)
     ],
     products: [
         .executable(name: "CodexSessionBar", targets: ["CodexSessionBar"])
