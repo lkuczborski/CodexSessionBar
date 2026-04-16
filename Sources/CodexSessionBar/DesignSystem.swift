@@ -4,8 +4,9 @@ enum LayoutMetrics {
     static let panelHorizontalInset: CGFloat = 18
     static let inlineLeadingInset: CGFloat = 12
     static let inlineTrailingInset: CGFloat = 8
-    static let compactControlVerticalInset: CGFloat = 6
-    static let composerVerticalInset: CGFloat = 14
+    static let compactControlVerticalInset: CGFloat = 4
+    static let compactControlHeight: CGFloat = 28
+    static let composerVerticalInset: CGFloat = 10
     static let transcriptVerticalInset: CGFloat = 22
     static let messageOpposingSpacer: CGFloat = 24
     static let messageMaxWidth: CGFloat = 520

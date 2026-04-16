@@ -32,7 +32,7 @@ struct MiniSelectorMenu<Content: View>: View {
                 }
                 .padding(.leading, LayoutMetrics.inlineLeadingInset)
                 .padding(.trailing, LayoutMetrics.inlineTrailingInset)
-                .padding(.vertical, LayoutMetrics.compactControlVerticalInset)
+                .frame(height: LayoutMetrics.compactControlHeight)
                 .overlay {
                     Capsule()
                         .strokeBorder(AdaptivePalette.controlStroke(for: colorScheme), lineWidth: 1)
