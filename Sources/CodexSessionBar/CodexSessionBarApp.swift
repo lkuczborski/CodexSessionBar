@@ -8,7 +8,9 @@ struct CodexSessionBarApp: App {
         MenuBarExtra {
             MenuLaunchpadView(model: model)
         } label: {
-            Label(model.menuBarTitle, systemImage: model.menuBarSymbol)
+            CodexMenuBarLabel(
+                title: model.menuBarTitle
+            )
         }
         .menuBarExtraStyle(.window)
     }
