@@ -178,7 +178,7 @@ struct MiniTranscriptEntryView: View {
     }
 
     private var horizontalInsetTrailing: CGFloat {
-        entry.kind == .user ? LayoutMetrics.inlineLeadingInset : LayoutMetrics.inlineLeadingInset
+        entry.kind == .user ? LayoutMetrics.inlineLeadingInset : LayoutMetrics.inlineTrailingInset
     }
 
     private var rowContentMaxWidth: CGFloat? {
@@ -206,7 +206,7 @@ struct MiniTranscriptEntryView: View {
     }
 
     private var copiesFromContentTap: Bool {
-        !entry.isStreaming
+        !entry.isStreaming && entry.kind == .tool
     }
 
     private var copyFlashColor: Color {
