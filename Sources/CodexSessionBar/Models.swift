@@ -106,6 +106,56 @@ struct ConversationEntry: Identifiable, Equatable, Sendable {
     let body: String
     let footnote: String?
     let isStreaming: Bool
+
+    var defaultTranscriptCollapsed: Bool {
+        canCollapseInTranscript
+    }
+
+    var canCollapseInTranscript: Bool {
+        kind == .tool && !isStreaming && transcriptLineCount > 2
+    }
+
+    var copyPayload: String {
+        ([showsTranscriptTitle ? title : nil, body.nonEmpty, footnote?.nonEmpty]
+            .compactMap { $0 }
+            .joined(separator: "\n\n"))
+            .nonEmpty ?? body
+    }
+
+    func matches(searchQuery: String) -> Bool {
+        let trimmedQuery = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedQuery.isEmpty else {
+            return true
+        }
+
+        return [title, body, footnote]
+            .compactMap { $0 }
+            .contains { $0.localizedCaseInsensitiveContains(trimmedQuery) }
+    }
+
+    var transcriptPreview: String {
+        body
+            .replacingOccurrences(of: "\n\n", with: "\n")
+            .trimmedForPreview(maxLength: 180)
+    }
+
+    private var transcriptLineCount: Int {
+        let normalizedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedBody.isEmpty else {
+            return 0
+        }
+
+        return normalizedBody.components(separatedBy: .newlines).count
+    }
+
+    var showsTranscriptTitle: Bool {
+        switch kind {
+        case .user, .assistant:
+            false
+        case .plan, .tool, .notice:
+            true
+        }
+    }
 }
 
 struct SessionBanner: Identifiable, Equatable, Sendable {
@@ -1269,7 +1319,7 @@ private extension Array<UserInputPayload> {
     }
 }
 
-private extension String {
+extension String {
     var humanizedProtocolLabel: String {
         replacingOccurrences(of: "([a-z])([A-Z])", with: "$1 $2", options: .regularExpression)
             .replacingOccurrences(of: "_", with: " ")
