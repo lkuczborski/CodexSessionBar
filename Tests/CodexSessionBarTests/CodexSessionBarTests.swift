@@ -213,6 +213,173 @@ final class CodexSessionBarTests: XCTestCase {
         XCTAssertTrue(ChatWindowRoute.draft().threadID == nil)
     }
 
+    func testConversationEntrySearchMatchesBodyTitleAndFootnote() {
+        let entry = ConversationEntry(
+            id: "tool-1",
+            kind: .tool,
+            title: "$ swift test",
+            body: "Executed unit tests for the mini transcript",
+            footnote: "Completed • /tmp/project",
+            isStreaming: false
+        )
+
+        XCTAssertTrue(entry.matches(searchQuery: "swift test"))
+        XCTAssertTrue(entry.matches(searchQuery: "mini transcript"))
+        XCTAssertTrue(entry.matches(searchQuery: "/tmp/project"))
+        XCTAssertFalse(entry.matches(searchQuery: "archive window"))
+    }
+
+    func testConversationEntryCopyPayloadIncludesContextualMetadata() {
+        let entry = ConversationEntry(
+            id: "plan-1",
+            kind: .plan,
+            title: "Plan",
+            body: "Add jump buttons and search.",
+            footnote: "2 steps",
+            isStreaming: false
+        )
+
+        XCTAssertEqual(entry.copyPayload, "Plan\n\nAdd jump buttons and search.\n\n2 steps")
+    }
+
+    func testConversationEntryDefaultCollapseTargetsToolEntries() {
+        let toolEntry = ConversationEntry(
+            id: "tool-1",
+            kind: .tool,
+            title: "$ swift build",
+            body: """
+            [0/1] Planning build
+            [1/1] Build complete
+            Finished in 0.2s
+            """,
+            footnote: "Completed",
+            isStreaming: false
+        )
+        let assistantEntry = ConversationEntry(
+            id: "assistant-1",
+            kind: .assistant,
+            title: "Codex",
+            body: "Ready.",
+            footnote: nil,
+            isStreaming: false
+        )
+
+        XCTAssertTrue(toolEntry.defaultTranscriptCollapsed)
+        XCTAssertFalse(assistantEntry.defaultTranscriptCollapsed)
+    }
+
+    func testConversationEntryShortToolOutputDoesNotCollapse() {
+        let shortToolEntry = ConversationEntry(
+            id: "tool-short",
+            kind: .tool,
+            title: "$ swift test",
+            body: """
+            [0/1] Planning build
+            Build complete!
+            """,
+            footnote: "Completed",
+            isStreaming: false
+        )
+
+        XCTAssertFalse(shortToolEntry.canCollapseInTranscript)
+        XCTAssertFalse(shortToolEntry.defaultTranscriptCollapsed)
+    }
+
+    func testTranscriptBodyParserSplitsFencedCodeBlocks() {
+        let body = """
+        Here is Swift:
+
+        ```swift
+        let value = 3
+        print(value)
+        ```
+
+        Done.
+        """
+
+        XCTAssertEqual(
+            TranscriptBodyParser.segments(from: body),
+            [
+                .text("Here is Swift:\n"),
+                .code(languageHint: "swift", code: "let value = 3\nprint(value)"),
+                .text("\nDone.")
+            ]
+        )
+    }
+
+    func testTranscriptBodyParserLeavesDanglingFenceAsText() {
+        let body = """
+        ```python
+        print("hi")
+        """
+
+        XCTAssertEqual(
+            TranscriptBodyParser.segments(from: body),
+            [.text("``` python\nprint(\"hi\")")]
+        )
+    }
+
+    func testTranscriptCodeLanguageRecognizesCommonAliases() {
+        XCTAssertEqual(TranscriptCodeLanguage(hint: "py"), .python)
+        XCTAssertEqual(TranscriptCodeLanguage(hint: "tsx"), .typescript)
+        XCTAssertEqual(TranscriptCodeLanguage(hint: "zsh"), .shell)
+        XCTAssertEqual(TranscriptCodeLanguage(hint: "yml"), .yaml)
+        XCTAssertNil(TranscriptCodeLanguage(hint: "ruby"))
+    }
+
+    func testTranscriptCodeDetectorInfersLanguageFromCommandTitlePath() {
+        let hint = TranscriptCodeDetector.inferLanguageHint(
+            preferredHint: nil,
+            title: "$ /bin/zsh -lc \"nl -ba Sources/CodexSessionBar/TranscriptBodyView.swift\"",
+            body: "1  import Foundation\n2  import SwiftUI"
+        )
+
+        XCTAssertEqual(hint, "swift")
+    }
+
+    func testTranscriptCodeDetectorTreatsNumberedSourceOutputAsCode() {
+        let body = """
+        1  import Foundation
+        2  import SwiftUI
+        3
+        4  enum TranscriptBodySegment: Equatable, Sendable {
+        5      case text(String)
+        6      case code(languageHint: String?, code: String)
+        7  }
+        """
+
+        XCTAssertTrue(
+            TranscriptCodeDetector.shouldRenderAsCode(
+                body,
+                preferredLanguageHint: "swift"
+            )
+        )
+    }
+
+    func testTranscriptMarkdownRendererPreservesLinks() {
+        let rendered = TranscriptMarkdownRenderer.attributedText(
+            from: "Open [docs](https://example.com/docs)"
+        )
+
+        let linkRuns = rendered.runs.compactMap { run -> URL? in
+            run.link
+        }
+
+        XCTAssertEqual(linkRuns, [URL(string: "https://example.com/docs")!])
+    }
+
+    func testTranscriptMarkdownRendererMarksInlineCode() {
+        let rendered = TranscriptMarkdownRenderer.attributedText(
+            from: "Use `swift test` here."
+        )
+
+        let hasCodeRun = rendered.runs.contains { run in
+            run.inlinePresentationIntent?.contains(.code) == true
+        }
+
+        XCTAssertTrue(hasCodeRun)
+    }
+
     @MainActor
     func testDisplayedSessionRoutePreservesSelectedThread() {
         let model = CodexMiniAppModel(autostart: false)
