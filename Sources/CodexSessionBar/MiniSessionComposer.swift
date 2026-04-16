@@ -18,7 +18,7 @@ struct MiniSessionComposer: View {
     let sendMessage: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .center, spacing: 10) {
                 controlsRow
             }
@@ -52,25 +52,26 @@ struct MiniSessionComposer: View {
             }
             .layoutPriority(1)
 
-            HStack(spacing: 10) {
-                Text("Fast")
-                    .font(.system(.subheadline, design: .rounded).weight(.semibold))
-                    .foregroundStyle(.secondary)
-
-                Toggle("", isOn: $fastModeEnabled)
-                    .labelsHidden()
-                    .toggleStyle(.switch)
+            Button {
+                fastModeEnabled.toggle()
+            } label: {
+                Image(systemName: fastModeEnabled ? "bolt.fill" : "bolt")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(fastModeEnabled ? Color.accentColor : Color.secondary)
+                    .frame(width: LayoutMetrics.compactControlHeight, height: LayoutMetrics.compactControlHeight)
+                    .background {
+                        Circle()
+                            .fill(fastModeEnabled ? Color.accentColor.opacity(colorScheme == .dark ? 0.18 : 0.12) : .clear)
+                    }
+                    .overlay {
+                        Circle()
+                            .strokeBorder(AdaptivePalette.controlStroke(for: colorScheme), lineWidth: 1)
+                    }
             }
-            .padding(.leading, LayoutMetrics.inlineLeadingInset)
-            .padding(.trailing, LayoutMetrics.inlineTrailingInset)
-            .padding(.vertical, LayoutMetrics.compactControlVerticalInset)
-            .overlay {
-                Capsule()
-                    .strokeBorder(AdaptivePalette.controlStroke(for: colorScheme), lineWidth: 1)
-            }
+            .buttonStyle(.plain)
             .shadow(color: AdaptivePalette.controlShadow(for: colorScheme), radius: 12, y: 4)
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel("Fast")
+            .accessibilityLabel(fastModeEnabled ? "Fast enabled" : "Fast disabled")
+            .help("Toggle Fast mode")
         }
     }
 
@@ -99,7 +100,7 @@ struct MiniSessionComposer: View {
         }
         .padding(.leading, LayoutMetrics.inlineLeadingInset)
         .padding(.trailing, LayoutMetrics.inlineTrailingInset)
-        .padding(.vertical, 8)
+        .padding(.vertical, 6)
         .overlay {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .strokeBorder(AdaptivePalette.chromeStroke(for: colorScheme), lineWidth: 1)
